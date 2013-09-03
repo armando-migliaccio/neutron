@@ -62,3 +62,8 @@ class MaintenanceInProgress(NvpPluginException):
     message = _("The networking backend is currently in maintenance mode and "
                 "therefore unable to accept requests which modify its state. "
                 "Please try later.")
+
+
+class ServiceClusterUnavailable(NvpPluginException):
+    message = _("Service cluster: '%(cluster_id)s' is unavailable. Please, "
+                "check NVP setup and/or configuration")

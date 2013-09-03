@@ -176,6 +176,20 @@ def get_all_query_pages(path, c):
 
 
 # -------------------------------------------------------------------
+# Logical Services functions
+# -------------------------------------------------------------------
+def service_cluster_exists(cluster, svc_cluster_uuid):
+    exists = False
+    try:
+        exists = do_request(HTTP_GET,
+                            "/ws.v1/service-cluster/%s" % svc_cluster_uuid,
+                            cluster=cluster) is not None
+    except exception.NotFound:
+        pass
+    return exists
+
+
+# -------------------------------------------------------------------
 # Network functions
 # -------------------------------------------------------------------
 def get_lswitches(cluster, neutron_net_id):

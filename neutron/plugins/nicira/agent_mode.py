@@ -22,9 +22,14 @@ from neutron.api.rpc.agentnotifiers import dhcp_rpc_agent_api
 from neutron.common import constants as const
 from neutron.common import topics
 from neutron.openstack.common import importutils
+from neutron.openstack.common import log as logging
 from neutron.openstack.common import rpc
 from neutron.plugins.nicira.common import config
+from neutron.plugins.nicira.common import exceptions as nvp_exc
 from neutron.plugins.nicira.dhcp_meta import rpc as nvp_rpc
+from neutron.plugins.nicira.dhcp_meta import nvp as nvp_dhcp
+
+LOG = logging.getLogger(__name__)
 
 
 class DhcpMetadataAccess(object):
@@ -46,13 +51,20 @@ class DhcpMetadataAccess(object):
                 nvp_rpc.handle_router_metadata_access
             )
         elif cfg.CONF.NVP.agent_mode == config.AgentModes.AGENTLESS:
-            # In agentless mode the following extensions, and related
-            # operations, are not supported; so do not publish them
-            if "agent" in self.supported_extension_aliases:
-                self.supported_extension_aliases.remove("agent")
-            if "dhcp_agent_scheduler" in self.supported_extension_aliases:
-                self.supported_extension_aliases.remove(
-                    "dhcp_agent_scheduler")
+            self._nvp_dhcp_metadata()
+            self.handle_network_dhcp_access_delegate = (
+                nvp_dhcp.handle_network_dhcp_access
+            )
+            self.handle_port_dhcp_access_delegate = (
+                nvp_dhcp.handle_port_dhcp_access
+            )
+            self.handle_port_metadata_access_delegate = (
+                nvp_dhcp.handle_port_metadata_access
+            )
+            self.handle_metadata_access_delegate = (
+                nvp_dhcp.handle_router_metadata_access
+            )
+
 
     def _rpc_dhcp_metadata(self):
         self.topic = topics.PLUGIN
@@ -66,6 +78,27 @@ class DhcpMetadataAccess(object):
         self.network_scheduler = importutils.import_object(
             cfg.CONF.network_scheduler_driver
         )
+
+    def _nvp_dhcp_metadata(self):
+        # In agentless mode the following extensions, and related
+        # operations, are not supported; so do not publish them
+        if "agent" in self.supported_extension_aliases:
+            self.supported_extension_aliases.remove("agent")
+        if "dhcp_agent_scheduler" in self.supported_extension_aliases:
+            self.supported_extension_aliases.remove(
+                "dhcp_agent_scheduler")
+        try:
+            error = None
+            nvp_dhcp.check_services_requirements(self.cluster)
+        except nvp_exc.NvpInvalidVersion:
+            error = _("Unable to run Neutron with config option '%s', as NVP "
+                      "does not support it") % config.AgentModes.AGENTLESS
+        except nvp_exc.ServiceClusterUnavailable:
+            error = _("Unmet dependency for config option "
+                      "'%s'") % config.AgentModes.AGENTLESS
+        if error:
+            LOG.exception(error)
+            raise nvp_exc.NvpPluginException(err_msg=error)
 
     def handle_network_dhcp_access(self, context, network, action):
         self.handle_network_dhcp_access_delegate(self, context,
