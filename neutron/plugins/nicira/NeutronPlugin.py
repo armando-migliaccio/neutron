@@ -1546,7 +1546,7 @@ class NvpPluginV2(addr_pair_db.AllowedAddressPairsMixin,
             # NOTE(salvatore-orlando): A failure in this operation will
             # cause the router delete operation to fail too.
             self.handle_router_metadata_access(
-                context, router_id, do_create=False)
+                context, router_id, interface=None)
             super(NvpPluginV2, self).delete_router(context, router_id)
             # If removal is successful in Neutron it should be so on
             # the NVP platform too - otherwise the transaction should
@@ -1628,7 +1628,8 @@ class NvpPluginV2(addr_pair_db.AllowedAddressPairsMixin,
         # Ensure the NVP logical router has a connection to a 'metadata access'
         # network (with a proxy listening on its DHCP port), by creating it
         # if needed.
-        self.handle_router_metadata_access(context, router_id)
+        self.handle_router_metadata_access(
+            context, router_id, interface=router_iface_info)
         LOG.debug(_("Add_router_interface completed for subnet:%(subnet_id)s "
                     "and router:%(router_id)s"),
                   {'subnet_id': subnet_id, 'router_id': router_id})
@@ -1672,7 +1673,8 @@ class NvpPluginV2(addr_pair_db.AllowedAddressPairsMixin,
         # Ensure the connection to the 'metadata access network'
         # is removed  (with the network) if this the last subnet
         # on the router
-        self.handle_router_metadata_access(context, router_id)
+        self.handle_router_metadata_access(
+            context, router_id, interface=info)
         try:
             if not subnet:
                 subnet = self._get_subnet(context, subnet_id)

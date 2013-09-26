@@ -22,6 +22,7 @@ from neutron.api.v2 import attributes as attr
 from neutron.common import constants as const
 from neutron.common import exceptions as n_exc
 from neutron.db import db_base_plugin_v2
+from neutron.db import l3_db
 from neutron.openstack.common import log as logging
 from neutron.plugins.nicira.common import exceptions as p_exc
 from neutron.plugins.nicira.nsxlib import lsn as lsn_api
@@ -29,7 +30,10 @@ from neutron.plugins.nicira import nvplib
 
 
 LOG = logging.getLogger(__name__)
-
+METADATA_MAC = "aa:bb:cc:dd:ee:ff"
+METADATA_PORT_ID = 'metadata:id'
+METADATA_PORT_NAME = 'metadata:name'
+METADATA_DEVICE_ID = 'metadata:device'
 
 dhcp_opts = [
     cfg.ListOpt('extra_domain_name_servers',
@@ -44,8 +48,25 @@ dhcp_opts = [
 ]
 
 
+metadata_opts = [
+    cfg.StrOpt('metadata_server_address', default='127.0.0.1',
+               help=_("IP address used by Metadata server.")),
+    cfg.IntOpt('metadata_server_port',
+               default=8775,
+               help=_("TCP Port used by Metadata server.")),
+    cfg.StrOpt('metadata_shared_secret',
+               default='',
+               help=_('Shared secret to sign instance-id request'),
+               secret=True)
+]
+
+
 def register_dhcp_opts(config):
     config.CONF.register_opts(dhcp_opts, "NVP_DHCP")
+
+
+def register_metadata_opts(config):
+    config.CONF.register_opts(metadata_opts, "NVP_METADATA")
 
 
 class LsnManager(object):
@@ -232,6 +253,56 @@ class DhcpAgentNotifyAPI(object):
         [resource, action, _e] = methodname.split('.')
         if resource == 'subnet':
             self._handle_subnet_dhcp_access[action](context, data['subnet'])
+        elif resource == 'port' and action == 'update':
+            self._port_update(context, data['port'])
+
+    def _port_update(self, context, port):
+        network_id = port['network_id']
+        try:
+            lsn_id = lsn_api.lsn_for_network_get(
+                self.plugin.cluster, network_id)
+        except n_exc.NotFound:
+            LOG.warn(_("Unable to find Logical Services "
+                       "Node for network %s"), network_id)
+            raise
+        else:
+            subnet_id = port["fixed_ips"][0]['subnet_id']
+            try:
+                lsn_port_id = lsn_api.lsn_port_by_subnet_get(
+                    self.plugin.cluster, lsn_id, subnet_id)
+            except n_exc.NotFound:
+                lsn_port_id = lsn_api.lsn_port_by_mac_get(
+                    self.plugin.cluster, lsn_id, METADATA_MAC)
+            filters = {'network_id': [network_id]}
+            ports = self.plugin.get_ports(context, filters)
+            if not ports:
+                return
+            dhcp_entries = [
+                {'mac_address': p['mac_address'],
+                 'ip_address': p["fixed_ips"][0]['ip_address']}
+                for p in ports
+                if (p.get("fixed_ips") and
+                    p['device_owner'] != const.DEVICE_OWNER_DHCP and
+                    p['device_owner'] != l3_db.DEVICE_OWNER_ROUTER_INTF)
+            ]
+            if dhcp_entries:
+                lsn_api.lsn_port_host_entries_update(self.plugin.cluster,
+                                                     lsn_id, lsn_port_id,
+                                                     'dhcp', dhcp_entries)
+            meta_entries = [
+                {'instance_id': p['device_id'],
+                 'ip_address': p["fixed_ips"][0]['ip_address']}
+                for p in ports
+                if (p['device_id'] and
+                    p.get('fixed_ips') and
+                    p['device_owner'] != const.DEVICE_OWNER_DHCP and
+                    p['device_owner'] != l3_db.DEVICE_OWNER_ROUTER_INTF)
+            ]
+            if meta_entries:
+                lsn_api.lsn_port_host_entries_update(self.plugin.cluster,
+                                                     lsn_id, lsn_port_id,
+                                                     'metadata-proxy',
+                                                     meta_entries)
 
     def _subnet_create(self, context, subnet, clean_on_err=True):
         if subnet['enable_dhcp']:
@@ -249,7 +320,7 @@ class DhcpAgentNotifyAPI(object):
             }
             try:
                 # This will end up calling handle_port_dhcp_access
-                # down below
+                # down below as well as handle_port_metadata_access
                 self.plugin.create_port(context, {'port': dhcp_port})
             except p_exc.PortConfigurationError as e:
                 err_msg = (_("Error while creating subnet %(cidr)s for "
@@ -272,8 +343,12 @@ class DhcpAgentNotifyAPI(object):
             self.lsn_manager.lsn_port_dhcp_configure(
                 lsn_id, lsn_port_id, subnet)
         except p_exc.LsnPortNotFound:
-            # It's possible that the subnet was created with dhcp off,
-            # hence the lsn port has not been provisioned
+            # It's possible that the subnet was created with dhcp off;
+            # check if the subnet was uplinked onto a router, and if so
+            # remove the patch attachment between the metadata port and
+            # the lsn port, in favor on the one we'll be creating during
+            # _subnet_create
+            _destroy_metadata_owner_port(self.plugin, lsn_id, network_id)
             self._subnet_create(context, subnet, clean_on_err=False)
 
     def _subnet_delete(self, context, subnet):
@@ -286,7 +361,7 @@ class DhcpAgentNotifyAPI(object):
         ports = self.plugin.get_ports(context, filters=filters)
         if ports:
             # This will end up calling handle_port_dhcp_access
-            # down below
+            # down below as well as handle_port_metadata_access
             self.plugin.delete_port(context, ports[0]['id'])
 
 
@@ -362,11 +437,118 @@ def handle_port_dhcp_access(plugin, context, port, action):
     LOG.info(_("DHCP for port %s configured successfully"), port['id'])
 
 
-def handle_port_metadata_access(context, port, is_delete=False):
-    # TODO(armando-migliaccio)
-    LOG.info('%s port with data %s' % (is_delete, port))
+def handle_port_metadata_access(plugin, context, port, is_delete=False):
+    if (port["device_owner"] != const.DEVICE_OWNER_DHCP and
+        port["device_owner"] != l3_db.DEVICE_OWNER_ROUTER_INTF and
+        port["device_id"]):
+        # TODO(armando-migliaccio): store network->LSN->LSN_Port mapping
+        # to avoid hitting NSX/NVP more than it is strictly necessary
+        network_id = port["network_id"]
+        lsn_id = lsn_api.lsn_for_network_get(plugin.cluster, network_id)
+        subnet_id = port["fixed_ips"][0]['subnet_id']
+        try:
+            lsn_port_id = lsn_api.lsn_port_by_subnet_get(
+                plugin.cluster, lsn_id, subnet_id)
+        except n_exc.NotFound:
+            lsn_port_id = lsn_api.lsn_port_by_mac_get(
+                plugin.cluster, lsn_id, METADATA_MAC)
+        data = {
+            "instance_id": port["device_id"],
+            "ip_address": port["fixed_ips"][0]['ip_address']
+        }
+        if not is_delete:
+            LOG.info(_("Adding metadata entry for port %s"), port['id'])
+            lsn_api.lsn_port_metadata_host_add(
+                plugin.cluster, lsn_id, lsn_port_id, data)
+        else:
+            try:
+                LOG.info(_("Removing metadata entry for port %s"), port['id'])
+                lsn_api.lsn_port_metadata_host_remove(
+                    plugin.cluster, lsn_id, lsn_port_id, data)
+            except n_exc.NotFound:
+                # do not fail if the port has been removed already
+                LOG.warn(_("Unable to remove metadata entry for "
+                           " port %s"), port['id'])
+                return
+        LOG.info(_("Port %(port)s configured successfully with "
+                   "metadata %(data)s") % {'port': port['id'], "data": data})
 
 
-def handle_router_metadata_access(plugin, context, router_id, do_create=True):
-    # TODO(armando-migliaccio)
-    LOG.info('%s router %s' % (do_create, router_id))
+def handle_router_metadata_access(plugin, context, router_id, interface=None):
+    LOG.info(_("Handle metadata access via router: %(r)s and "
+               "interface %(i)s") % {'r': router_id, 'i': interface})
+    if interface:
+        subnet = plugin.get_subnet(context, interface['subnet_id'])
+        network_id = subnet['network_id']
+        try:
+            lsn_id = lsn_api.lsn_for_network_get(plugin.cluster, network_id)
+        except n_exc.NotFound:
+            LOG.warn(_("Unable to find Logical Services "
+                       "Node for network %s"), network_id)
+            raise
+        else:
+            try:
+                plugin.get_port(context, interface['port_id'])
+                is_enabled = True
+            except n_exc.PortNotFound:
+                is_enabled = False
+            _configure_metadata_services(plugin, subnet, lsn_id, is_enabled)
+    LOG.info(_("Metadata for router %s handled successfully"), router_id)
+
+
+def _create_metadata_owner_port(plugin, lsn_id, subnet):
+    data = {
+        "mac_address": METADATA_MAC,
+        "ip_address": subnet['cidr'],
+        "subnet_id": subnet['id']
+    }
+    lsn_port_id = lsn_api.lsn_port_create(plugin.cluster, lsn_id, data)
+    lswitch_port_id = nvplib.create_lport(
+        plugin.cluster, subnet['network_id'], subnet['tenant_id'],
+        METADATA_PORT_ID, METADATA_PORT_NAME,
+        METADATA_DEVICE_ID, True)['uuid']
+    lsn_api.lsn_port_plug_network(
+        plugin.cluster, lsn_id, lsn_port_id, lswitch_port_id)
+
+
+def _destroy_metadata_owner_port(plugin, lsn_id, network_id):
+    try:
+        lsn_port_id = lsn_api.lsn_port_by_mac_get(
+            plugin.cluster, lsn_id, METADATA_MAC)
+        lsn_api.lsn_port_delete(plugin.cluster, lsn_id, lsn_port_id)
+    except n_exc.NotFound:
+        LOG.warning(_("Unable to find Logical Services Node "
+                      "Port with MAC %s"), METADATA_MAC)
+    else:
+        try:
+            lswitch_port_id = nvplib.get_port_by_neutron_tag(
+                plugin.cluster, network_id, METADATA_PORT_ID)['uuid']
+            nvplib.delete_port(
+                plugin.cluster, network_id, lswitch_port_id)
+        except n_exc.PortNotFoundOnNetwork:
+            LOG.warning(_("Metadata port not found while attempting "
+                          "to delete it from network %s"), network_id)
+
+
+def _configure_metadata_services(plugin, subnet, lsn_id, is_enabled):
+    metadata_options = {
+        'metadata_server_ip': cfg.CONF.NVP_METADATA.metadata_server_address,
+        'metadata_server_port': cfg.CONF.NVP_METADATA.metadata_server_port,
+        'metadata_proxy_shared_secret': (
+            cfg.CONF.NVP_METADATA.metadata_shared_secret
+        )
+    }
+    lsn_api.lsn_metadata_configure(
+        plugin.cluster, lsn_id, is_enabled, metadata_options)
+    if is_enabled:
+        # if subnet had dhcp off when created, no lsn port exists,
+        # so create one, and wire it
+        try:
+            lsn_api.lsn_port_by_subnet_get(
+                plugin.cluster, lsn_id, subnet['id'])
+        except n_exc.NotFound:
+            _create_metadata_owner_port(plugin, lsn_id, subnet)
+    else:
+        # otherwise, remove the metadata port if it exists
+        _destroy_metadata_owner_port(plugin, lsn_id, subnet['network_id'])
+    LOG.info(_("Metadata access for LSN %s configured successfully"), lsn_id)
