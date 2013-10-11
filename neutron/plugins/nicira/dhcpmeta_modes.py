@@ -26,6 +26,7 @@ from neutron.openstack.common import log as logging
 from neutron.openstack.common import rpc
 from neutron.plugins.nicira.common import config
 from neutron.plugins.nicira.common import exceptions as nvp_exc
+from neutron.plugins.nicira.dhcp_meta import combined
 from neutron.plugins.nicira.dhcp_meta import nvp as nvp_svc
 from neutron.plugins.nicira.dhcp_meta import rpc as nvp_rpc
 
@@ -42,6 +43,9 @@ class DhcpMetadataAccess(object):
         elif cfg.CONF.NVP.agent_mode == config.AgentModes.AGENTLESS:
             self._setup_nvp_dhcp_metadata()
             mod = nvp_svc
+        elif cfg.CONF.NVP.agent_mode == config.AgentModes.COMBINED:
+            self._setup_combined_dhcp_metadata()
+            mod = combined
         self.handle_network_dhcp_access_delegate = (
             mod.handle_network_dhcp_access
         )
@@ -55,14 +59,14 @@ class DhcpMetadataAccess(object):
             mod.handle_router_metadata_access
         )
 
-    def _setup_rpc_dhcp_metadata(self):
+    def _setup_rpc_dhcp_metadata(self, notifier=None):
         self.topic = topics.PLUGIN
         self.conn = rpc.create_connection(new=True)
         self.dispatcher = nvp_rpc.NVPRpcCallbacks().create_rpc_dispatcher()
         self.conn.create_consumer(self.topic, self.dispatcher,
                                   fanout=False)
         self.agent_notifiers[const.AGENT_TYPE_DHCP] = (
-            dhcp_rpc_agent_api.DhcpAgentNotifyAPI())
+            notifier or dhcp_rpc_agent_api.DhcpAgentNotifyAPI())
         self.conn.consume_in_thread()
         self.network_scheduler = importutils.import_object(
             cfg.CONF.network_scheduler_driver
@@ -86,15 +90,26 @@ class DhcpMetadataAccess(object):
         # owners list
         if const.DEVICE_OWNER_DHCP not in self.port_special_owners:
             self.port_special_owners.append(const.DEVICE_OWNER_DHCP)
+        self._check_services_requirements(config.AgentModes.AGENTLESS)
+        nvp_svc.register_dhcp_opts(cfg)
+        nvp_svc.register_metadata_opts(cfg)
+
+    def _setup_combined_dhcp_metadata(self):
+        self._check_services_requirements(config.AgentModes.COMBINED)
+        self._setup_rpc_dhcp_metadata(combined.DhcpAgentNotifyAPI(self))
+        nvp_svc.register_dhcp_opts(cfg)
+        nvp_svc.register_metadata_opts(cfg)
+
+    def _check_services_requirements(self, config_mode):
         try:
             error = None
             nvp_svc.check_services_requirements(self.cluster)
         except nvp_exc.NvpInvalidVersion:
             error = _("Unable to run Neutron with config option '%s', as NVP "
-                      "does not support it") % config.AgentModes.AGENTLESS
+                      "does not support it") % config_mode
         except nvp_exc.ServiceClusterUnavailable:
             error = _("Unmet dependency for config option "
-                      "'%s'") % config.AgentModes.AGENTLESS
+                      "'%s'") % config_mode
         if error:
             LOG.exception(error)
             raise nvp_exc.NvpPluginException(err_msg=error)
